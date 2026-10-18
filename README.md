@@ -8,11 +8,12 @@ A tiny daily research bot. GitHub Actions picks a curiosity topic, calls one web
 
 1. Runs every day at **08:00 Vietnam time** (01:00 UTC).
 2. Chooses a topic from [`topics.txt`](topics.txt), trying not to reuse one from the last 30 days.
-3. Calls the Orthogonal unified Run API with a Tavily search request.
+3. Calls Tavily through the official Orthogonal CLI (`npx @orth/cli run ... --raw`) so endpoint routing and parameter handling are delegated to the supported client.
 4. Writes `journal/rabbit-holes/YYYY-MM-DD-topic.md` and updates [`journal/index.md`](journal/index.md).
 5. Saves a small topic history in `data/history.json` to avoid repetition.
+6. If Telegram secrets are configured, sends a daily digest with up to three clickable source links through your Telegram bot.
 
-The workflow can also be started manually and given a specific topic.
+The workflow can also be started manually and given a specific topic. Telegram delivery is optional; without its two secrets, the journal still gets generated and committed.
 
 ## Set it up
 
@@ -26,26 +27,53 @@ Create a GitHub repository and upload/push these files. Keep it private if you d
 2. In the repo, open **Settings → Secrets and variables → Actions → New repository secret**.
 3. Name it `ORTHOGONAL_API_KEY` and paste the key as the value. Never commit the key to Git.
 
-### 3. Check the provider endpoint and its price
+### 3. Optional: send the daily results to Telegram
+
+1. In Telegram, open **@BotFather**, send `/newbot`, and follow the prompts. Save the token it returns.
+2. Open your new bot using its `t.me` link, press **Start**, and send `/start` in the private chat. Telegram requires the user to start a private chat before the bot can message them.
+3. Retrieve your chat ID. On Windows PowerShell, run the following, then paste the token when prompted:
+
+   ```powershell
+   $secure = Read-Host "Paste Telegram bot token" -AsSecureString
+   $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+   try {
+     $env:TELEGRAM_BOT_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+     $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/getUpdates"
+     $updates.result | ForEach-Object { if ($_.message) { [PSCustomObject]@{ chat_id = $_.message.chat.id; type = $_.message.chat.type; username = $_.message.chat.username; title = $_.message.chat.title } } } | Format-Table -AutoSize
+   } finally {
+     if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+     Remove-Item Env:\TELEGRAM_BOT_TOKEN -ErrorAction SilentlyContinue
+   }
+   ```
+
+   Use the `chat_id` on the `private` row. If no row appears, send `/start` to the bot and retry. For a group, add the bot to the group and use that group's `message.chat.id`. For a channel, make the bot an administrator with permission to post; public channels can use `@channelusername`.
+4. In your GitHub repo, open **Settings → Secrets and variables → Actions → New repository secret** and create:
+   - `TELEGRAM_BOT_TOKEN` — token from @BotFather
+   - `TELEGRAM_CHAT_ID` — private chat/group ID or `@channelusername`
+5. Run the workflow manually once. After each successful search, the bot sends the topic, query, up to three links, and follow-up trails. It uses Telegram's Bot API directly, so it does not consume Orthogonal search credits.
+
+Never commit the Telegram token to code or YAML. If Telegram delivery fails temporarily, the workflow logs a warning but still commits the generated journal.
+
+### 4. Check the provider endpoint and its price
 
 This starter defaults to `tavily` + `/search`, using the same route shown in the Orthogonal CLI's quick-start examples. Provider schemas and pricing can change, so inspect the live definition before the first billable run:
 
 ```bash
 npx @orth/cli api show tavily /search
-npx @orth/cli run tavily /search --dry-run -q 'query=why old websites survive' -q search_depth=basic -q max_results=5
+npx @orth/cli run tavily /search --dry-run -q 'query=why old websites survive'
 ```
 
-If your account/catalog exposes a different search provider or parameter schema, update `ORTHOGONAL_SEARCH_API`, `ORTHOGONAL_SEARCH_PATH`, and the `query` object in `scripts/rabbit_hole.py` as needed. You can search the catalog with:
+If your account/catalog exposes a different search provider or parameter schema, update `ORTHOGONAL_SEARCH_API` and `ORTHOGONAL_SEARCH_PATH` in the workflow. The current code intentionally sends only the documented `query` parameter to avoid passing unverified provider-specific fields. You can search the catalog with:
 
 ```bash
 npx @orth/cli api search "low-cost web search returning titles, URLs, and snippets"
 ```
 
-### 4. Enable Actions write permission
+### 5. Enable Actions write permission
 
 The workflow declares `permissions: contents: write` so it can commit generated Markdown and history. In repository **Settings → Actions → General**, check that workflow permissions are not restricted by an organization policy.
 
-### 5. Run a manual test
+### 6. Run a manual test
 
 Open **Actions → Internet Rabbit Hole → Run workflow**. You may enter a topic such as:
 
@@ -79,15 +107,16 @@ Do not paste a real key into a committed script, notebook, workflow YAML, or iss
 | `ORTHOGONAL_API_KEY` | — | Required secret |
 | `ORTHOGONAL_SEARCH_API` | `tavily` | Orthogonal provider slug |
 | `ORTHOGONAL_SEARCH_PATH` | `/search` | Provider endpoint path |
-| `ORTHOGONAL_SEARCH_DEPTH` | `basic` | Search depth parameter |
-| `MAX_RESULTS` | `5` | Result count, clamped to 3–8 |
+| `MAX_RESULTS` | `5` | Maximum number of returned results retained in the journal (3–8) |
 | `SEARCH_SUFFIX` | `strange history surprising facts explained` | Added to each topic query |
 | `RABBIT_HOLE_TOPIC` | empty | Override the selected topic for a run |
+| `TELEGRAM_BOT_TOKEN` | empty | Optional Telegram bot token; configured as a GitHub secret |
+| `TELEGRAM_CHAT_ID` | empty | Optional private chat/group ID or `@channelusername` |
 
 ## Cost and safety guardrails
 
-- The workflow makes **one Orthogonal Run API request per execution**. The default $10 Orthogonal starter credit is not a guarantee of unlimited usage; the selected endpoint's current price applies.
-- The code does not call an LLM and does not scrape each result. It publishes links and returned excerpts to keep the initial experiment inexpensive.
+- The workflow makes **one Orthogonal search request per execution** through the official Orthogonal CLI. The default $10 Orthogonal starter credit is not a guarantee of unlimited usage; the selected endpoint's current price applies.
+- The code does not call an LLM and does not scrape each result. It publishes links and returned excerpts to keep the initial experiment inexpensive. Telegram delivery uses the Bot API and does not spend Orthogonal credits.
 - Check the endpoint schema and use the CLI's `--dry-run` before the first live request. Keep `MAX_RESULTS` small.
 - Never let page text or search snippets trigger shell commands or workflow edits. This project treats fetched data as untrusted content and only writes Markdown.
 - Review source URLs, dates, and context. Search snippets may be wrong or incomplete.
@@ -105,3 +134,5 @@ Do not paste a real key into a committed script, notebook, workflow YAML, or iss
 - [Orthogonal pricing](https://www.orthogonal.com/pricing)
 - [Orthogonal CLI](https://github.com/orthogonal-sh/cli)
 - [GitHub Actions workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- [Telegram bot tutorial](https://core.telegram.org/bots/tutorial)
+- [Telegram Bot API: sendMessage](https://core.telegram.org/bots/api#sendmessage)

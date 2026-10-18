@@ -1,7 +1,10 @@
 import importlib.util
+import json
+import os
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "rabbit_hole.py"
 spec = importlib.util.spec_from_file_location("rabbit_hole", SCRIPT)
@@ -11,6 +14,34 @@ spec.loader.exec_module(rabbit)
 
 
 class RabbitHoleTests(unittest.TestCase):
+    def test_orthogonal_search_uses_official_cli(self):
+        completed = rabbit.subprocess.CompletedProcess(
+            args=["npx"], returncode=0,
+            stdout='{"results":[{"title":"Example","url":"https://example.com","content":"Snippet"}]}',
+            stderr="",
+        )
+        with patch.dict(os.environ, {"ORTHOGONAL_API_KEY": "test-key"}):
+            with patch.object(rabbit.subprocess, "run", return_value=completed) as mocked_run:
+                payload, price = rabbit.orthogonal_search("test query")
+        self.assertIn("results", payload)
+        self.assertIsNone(price)
+        args, kwargs = mocked_run.call_args
+        self.assertIn("@orth/cli", args[0])
+        self.assertIn("tavily", args[0])
+        self.assertIn("/search", args[0])
+        self.assertIn("query=test query", args[0])
+        self.assertIn("--raw", args[0])
+        self.assertEqual(kwargs["env"]["ORTHOGONAL_API_KEY"], "test-key")
+
+    def test_orthogonal_search_surfaces_cli_error(self):
+        completed = rabbit.subprocess.CompletedProcess(
+            args=["npx"], returncode=1, stdout="", stderr="API schema validation failed"
+        )
+        with patch.dict(os.environ, {"ORTHOGONAL_API_KEY": "test-key"}):
+            with patch.object(rabbit.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(RuntimeError, "API schema validation failed"):
+                    rabbit.orthogonal_search("test query")
+
     def test_normalize_tavily_style_payload(self):
         payload = {"data": {"results": [
             {"title": "Example", "url": "https://example.com/page", "content": "A snippet"},

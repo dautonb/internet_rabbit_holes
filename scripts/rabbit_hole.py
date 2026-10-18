@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -84,6 +85,12 @@ def configured_max_results() -> int:
 
 
 def orthogonal_search(query: str) -> tuple[dict[str, Any], str | None]:
+    """Search through Orthogonal's official CLI to avoid hand-building gateway requests.
+
+    Orthogonal documents `orth run tavily /search -q query=... --raw` as the
+    supported invocation. The CLI resolves the endpoint metadata and emits raw
+    JSON, while ORTHOGONAL_API_KEY is read from the environment in CI.
+    """
     api_key = os.environ.get("ORTHOGONAL_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ORTHOGONAL_API_KEY is missing. Add it to GitHub Actions Secrets or your shell environment.")
@@ -93,60 +100,63 @@ def orthogonal_search(query: str) -> tuple[dict[str, Any], str | None]:
     if not api_path.startswith("/"):
         api_path = "/" + api_path
 
-    max_results = configured_max_results()
-
-    body = {
-        "api": api_slug,
-        "path": api_path,
-        "query": {
-            "query": query,
-            "search_depth": os.environ.get("ORTHOGONAL_SEARCH_DEPTH", "basic"),
-            # Orthogonal's `query` object represents query-string parameters;
-            # values must be strings even when the upstream API documents an integer.
-            "max_results": str(max_results),
-        },
-    }
-    request = urllib.request.Request(
-        "https://api.orthogonal.com/v1/run",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "internet-rabbit-hole/0.1",
-        },
-        method="POST",
-    )
-
+    # Keep to the documented query argument first. Extra parameters can be
+    # added once confirmed against `orth api show <provider> <path>`; guessing
+    # endpoint-specific fields can trigger upstream HTTP 422 errors.
+    command = [
+        "npx", "--yes", "@orth/cli", "run", api_slug, api_path,
+        "-q", f"query={query}", "--raw",
+    ]
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        # Do not print request headers; they contain the API key.
-        detail = ""
-        try:
-            err = json.loads(exc.read().decode("utf-8"))
-            detail = str(err.get("error", err.get("message", "")))[:500] if isinstance(err, dict) else ""
-        except Exception:
-            pass
-        message = f"Orthogonal HTTP {exc.code}. {detail}".strip()
-        if exc.code in (400, 404, 422):
-            message += f" Check provider/path/parameters with: npx @orth/cli api show {api_slug} {api_path}"
-        raise RuntimeError(message) from None
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach Orthogonal: {exc.reason}") from None
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=os.environ.copy(),
+        )
+    except FileNotFoundError:
+        raise RuntimeError("Node.js/npm is missing; GitHub Actions must set up Node.js before running the search.") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Orthogonal CLI search timed out after 90 seconds.") from None
+
+    if completed.returncode != 0:
+        # CLI errors are useful to diagnose schema/auth/credit failures. Never
+        # echo the environment or request headers, which may contain secrets.
+        detail = (completed.stderr or completed.stdout or "No error details returned by Orthogonal CLI.").strip()
+        detail = detail.replace(api_key, "[REDACTED]")
+        detail = re.sub(r"\s+", " ", detail)[:700]
+        raise RuntimeError(f"Orthogonal CLI search failed (exit {completed.returncode}): {detail}")
+
+    raw_output = completed.stdout.strip()
+    try:
+        payload = json.loads(raw_output)
     except json.JSONDecodeError:
-        raise RuntimeError("Orthogonal returned a non-JSON response") from None
+        # Be tolerant if an npm/CLI notice precedes the JSON payload, while
+        # still requiring an actual JSON object/array in the output.
+        first_obj = raw_output.find("{")
+        first_arr = raw_output.find("[")
+        candidates = [pos for pos in (first_obj, first_arr) if pos >= 0]
+        if not candidates:
+            raise RuntimeError("Orthogonal CLI returned no JSON. Re-run `npx @orth/cli run tavily /search -q query=... --raw` locally to inspect output.") from None
+        start = min(candidates)
+        try:
+            payload = json.loads(raw_output[start:])
+        except json.JSONDecodeError:
+            raise RuntimeError("Orthogonal CLI output was not valid JSON. Check the CLI version and endpoint response.") from None
 
-    if isinstance(payload, dict) and payload.get("success") is False:
-        message = payload.get("error") or payload.get("message") or "request failed"
-        raise RuntimeError(f"Orthogonal request failed: {str(message)[:500]}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Orthogonal CLI returned unexpected JSON type: {type(payload).__name__}")
+    if payload.get("success") is False or payload.get("ok") is False:
+        detail = payload.get("error") or payload.get("message") or "request failed"
+        raise RuntimeError(f"Orthogonal search failed: {str(detail)[:500]}")
 
-    price = None
-    if isinstance(payload, dict):
-        price = payload.get("price")
-        if price is None and isinstance(payload.get("billing"), dict):
-            price = payload["billing"].get("price")
+    price = payload.get("price")
+    if price is None and isinstance(payload.get("billing"), dict):
+        price = payload["billing"].get("price")
+    if price is None and isinstance(payload.get("_meta"), dict):
+        price = payload["_meta"].get("price")
     return payload, str(price) if price is not None else None
 
 
