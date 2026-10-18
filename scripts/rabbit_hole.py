@@ -101,7 +101,9 @@ def orthogonal_search(query: str) -> tuple[dict[str, Any], str | None]:
         "query": {
             "query": query,
             "search_depth": os.environ.get("ORTHOGONAL_SEARCH_DEPTH", "basic"),
-            "max_results": max_results,
+            # Orthogonal's `query` object represents query-string parameters;
+            # values must be strings even when the upstream API documents an integer.
+            "max_results": str(max_results),
         },
     }
     request = urllib.request.Request(
